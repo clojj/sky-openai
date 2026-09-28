@@ -9,20 +9,19 @@ It gives you two `Std.Ai.Provider.Provider` backends:
 Both return an ordinary `Provider`, so they compose with `Std.Ai.Agent`,
 `Std.Ai.Policy`, `Std.Ai.Trace`, and `cost` exactly like a built-in provider.
 
-The package is built entirely on `Std.Ai.Provider.custom`, the stdlib extension
-point. Provider-specific logic lives here, not in the Sky stdlib, which stays
-vendor-neutral. This repo is the reference use case for `Provider.custom`: it
-shows how to add a new backend, wire format, or API to Sky without any compiler
-or stdlib change.
+The Responses provider is built on `Std.Ai.Provider.customTools`; Chat is a thin
+alias over the stdlib provider. Provider-specific wire logic lives here, while the
+stdlib stays vendor-neutral.
 
 ## Requirements
 
-You need a Sky toolchain that includes `Std.Ai.Provider.custom`. That is Sky
-**after** v0.25.6. On an older Sky the package will not resolve `Provider.custom`.
-Check with:
+You need **Sky v0.26.0 or later**: tool calling over the Responses API uses
+`Std.Ai.Provider.customTools` and `ToolCall.continuation`, which first shipped in
+v0.26.0. On an older Sky the package fails to compile (`ToolCall` has no
+`continuation` field). Check with:
 
 ```bash
-sky doc Std.Ai.Provider | grep custom
+sky --version   # sky v0.26.0 or later
 ```
 
 ## Install
@@ -50,6 +49,28 @@ provider =
 -- Provider.chat provider [ Provider.user "Say hello." ]
 --     |> Task.map .content
 ```
+
+For reasoning-capable models, opt in to `reasoning.effort` with a typed level.
+The available level remains model-dependent; as an example, GPT-5.6 Luna supports `None`, `Low`,
+`Medium`, `High`, `XHigh`, and `Max`.
+
+```elm
+reasoningProvider : Provider.Provider
+reasoningProvider =
+    Responses.providerWithReasoningEffort
+        (Secret.fromEnv "OPENAI_API_KEY")
+        "gpt-5.6-luna"
+        Responses.High
+```
+
+
+### Native local tools
+
+`Responses.provider` also works with `Agent.nativeToolLoop`. It advertises each
+`Std.Ai.Tool` as a flat Responses `function` tool, executes it locally through the
+stdlib loop, and sends tool results back with `previous_response_id`. Tool arguments
+remain the JSON string passed to the tool's `exec`; the current `Tool` contract only
+supplies a name and description, so its function schema is a permissive object.
 
 Chat Completions (also built into the stdlib as `Provider.openai`; exposed here
 so the whole OpenAI surface is in one package):
@@ -83,15 +104,20 @@ Agent.oneShot db (Responses.provider key "gpt-4o-mini")
 - `SkyOpenAI.Responses.provider` / `providerAt` — a single Responses call: the
   messages go out as the Responses `input`, the `output_text` parts and the token
   `usage` come back as a `Provider.ChatResponse`.
-- `SkyOpenAI.Responses.decodeResponse` — decode a raw Responses body yourself.
+- `SkyOpenAI.Responses.providerWithReasoningEffort` /
+  `providerAtWithReasoningEffort` — opt into `reasoning.effort` for models that
+  support it.
+- `SkyOpenAI.Responses.encodeRequest` / `decodeResponse` — encode or decode raw
+  plain-chat Responses API bodies yourself.
+- `SkyOpenAI.Responses.encodeToolRequest` / `decodeToolResponse` — encode and
+  decode native function-calling requests and responses. Provider-owned
+  continuations use `previous_response_id` after a tool call.
+
 
 ## Roadmap
 
-Each item stays inside this package, no stdlib change:
-
-- Stateful chaining with `previous_response_id`.
-- The server-side built-in tools (web_search, file_search, code_interpreter).
-- Native function-calling, via `Std.Ai.Provider.customTools`.
+- Server-side built-in tools (`web_search`, `file_search`, `code_interpreter`).
+- Stateful chaining for ordinary chat, outside `Agent.nativeToolLoop`.
 
 ## Test
 
@@ -99,7 +125,7 @@ Each item stays inside this package, no stdlib change:
 sky test tests/ResponsesTest.sky
 ```
 
-The tests decode a canonical Responses body offline. No network, no key.
+The tests encode and decode Responses bodies offline. No network, no key.
 
 ## Licence
 

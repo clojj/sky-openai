@@ -1,4 +1,18 @@
-module SkyOpenAI.Responses exposing (provider, providerAt, decodeResponse)
+module SkyOpenAI.Responses exposing
+    ( ReasoningEffort(..)
+    , RequestOptions
+    , provider
+    , providerWithReasoningEffort
+    , providerAt
+    , providerAtWithReasoningEffort
+    , providerWithOptions
+    , providerAtWithOptions
+    , encodeRequest
+    , encodeRequestWithOptions
+    , encodeToolRequest
+    , decodeResponse
+    , decodeToolResponse
+    )
 
 {-| `SkyOpenAI.Responses` — the OpenAI Responses API as a Sky `Provider`.
 
@@ -7,8 +21,8 @@ module maps a Sky chat (a `List Provider.Message`) onto a single Responses call 
 returns the assistant text plus token usage, so it drops into `Std.Ai.Agent`,
 `Policy`, `Trace`, and `cost` exactly like the built-in chat-completions provider.
 
-It is built on `Provider.custom`, the `Std.Ai.Provider` extension point, so no
-compiler or stdlib change is needed to add it.
+It is built on `Provider.customTools`, the `Std.Ai.Provider` extension point, so
+plain chat and `Std.Ai.Agent.nativeToolLoop` both use the same provider value.
 
     import SkyOpenAI.Responses as Responses
     import Sky.Core.Secret as Secret
@@ -16,46 +30,139 @@ compiler or stdlib change is needed to add it.
     provider =
         Responses.provider (Secret.fromEnv "OPENAI_API_KEY") "gpt-4o-mini"
 
-This is a first cut: it sends the messages as the Responses `input`, reads the
-`output_text` parts and the token `usage`, and returns a `Provider.ChatResponse`.
-Stateful chaining (`previous_response_id`), the server-side built-in tools
-(web_search, file_search), and native function-calling are the next increments,
-each of which stays inside this module.
+This module sends messages as the Responses `input`, optionally sets
+`reasoning.effort`, reads the `output_text` parts from message items, and returns
+token usage. Native local functions are advertised as Responses `function` tools;
+`function_call` output items become Sky `ToolCall`s, and the native tool loop
+continues through `previous_response_id`. Server-side built-in tools (web_search,
+file_search) and ordinary chat conversation chaining remain outside this provider
+surface.
 -}
 
 import Sky.Core.Prelude exposing (..)
 import Sky.Core.Task as Task
 import Sky.Core.Error as Error
 import Sky.Core.String as String
+import Sky.Core.List as List
 import Sky.Core.Secret exposing (Secret)
 import Sky.Core.Http as Http
 import Sky.Core.Json.Encode as JsonE
 import Sky.Core.Json.Decode as JsonD
 import Std.Ai.Provider as Provider exposing (ChatResponse, Message, Provider)
 
+{-| The documented `reasoning.effort` values for a Responses request.
 
-{-| A Responses provider against the hosted OpenAI endpoint. -}
+Support remains model-dependent; callers must choose a level accepted by the
+selected model. OpenAI returns HTTP 400 for an unsupported level.
+-}
+type ReasoningEffort
+    = None
+    | Minimal
+    | Low
+    | Medium
+    | High
+    | XHigh
+    | Max
+
+{-| Optional Responses provider behavior. -}
+type alias RequestOptions =
+    { reasoningEffort : Maybe ReasoningEffort }
+
+type alias CallBatch =
+    { calls : List Provider.ToolCall
+    , following : List Provider.Turn
+    }
+
+type alias ContinuationContext =
+    { responseId : String
+    , following : List Provider.Turn
+    }
+
+type alias ResponseFunctionCall =
+    { id : String
+    , name : String
+    , arguments : String
+    }
+
+
+openAiHttpTimeoutMs : Int
+openAiHttpTimeoutMs =
+    60000
+
+
+{-| A Responses provider against the hosted OpenAI endpoint.
+
+This leaves `reasoning.effort` unset, so OpenAI selects the model default.
+-}
 provider : Secret -> String -> Provider
 provider apiKey model =
-    providerAt "https://api.openai.com/v1/responses" apiKey model
+    providerAtWithOptions
+        "https://api.openai.com/v1/responses"
+        apiKey
+        model
+        { reasoningEffort = Nothing }
+
+
+{-| A hosted Responses provider that sets `reasoning.effort`.
+
+    Responses.providerWithReasoningEffort apiKey "gpt-5.6-luna" High
+-}
+providerWithReasoningEffort : Secret -> String -> ReasoningEffort -> Provider
+providerWithReasoningEffort apiKey model effort =
+    providerAtWithOptions
+        "https://api.openai.com/v1/responses"
+        apiKey
+        model
+        { reasoningEffort = Just effort }
 
 
 {-| A Responses provider against a specific endpoint — an Azure deployment, a
-proxy, or a compatible gateway.
+proxy, or a compatible gateway. This leaves `reasoning.effort` unset.
 -}
 providerAt : String -> Secret -> String -> Provider
 providerAt endpoint apiKey model =
-    Provider.custom (chatViaResponses endpoint apiKey model)
+    providerAtWithOptions endpoint apiKey model { reasoningEffort = Nothing }
 
 
-chatViaResponses : String -> Secret -> String -> List Message -> Task Error ChatResponse
-chatViaResponses endpoint apiKey model messages =
+{-| A Responses provider against a specific endpoint that sets
+`reasoning.effort`.
+-}
+providerAtWithReasoningEffort : String -> Secret -> String -> ReasoningEffort -> Provider
+providerAtWithReasoningEffort endpoint apiKey model effort =
+    providerAtWithOptions
+        endpoint
+        apiKey
+        model
+        { reasoningEffort = Just effort }
+
+
+{-| A hosted Responses provider with request options. -}
+providerWithOptions : Secret -> String -> RequestOptions -> Provider
+providerWithOptions apiKey model options =
+    providerAtWithOptions
+        "https://api.openai.com/v1/responses"
+        apiKey
+        model
+        options
+
+
+{-| A Responses provider against a specific endpoint with request options. -}
+providerAtWithOptions : String -> Secret -> String -> RequestOptions -> Provider
+providerAtWithOptions endpoint apiKey model options =
+    Provider.customTools
+        (chatViaResponses endpoint apiKey model options)
+        (chatToolsViaResponses endpoint apiKey model options)
+
+
+chatViaResponses : String -> Secret -> String -> RequestOptions -> List Message -> Task Error ChatResponse
+chatViaResponses endpoint apiKey model options messages =
     let
         req = Http.defaultRequest endpoint
     in
         { req | method = "POST" } |> Http.withBearer apiKey
             |> Http.withHeader "Content-Type" "application/json"
-            |> Http.withBody (requestBody model messages)
+            |> Http.withBody (encodeRequestWithOptions model options messages)
+            |> Http.withTimeout openAiHttpTimeoutMs
             |> Http.request
             |> Task.andThen
                    (\resp ->
@@ -77,6 +184,39 @@ chatViaResponses endpoint apiKey model messages =
                                        ++ resp.body)))
 
 
+chatToolsViaResponses : String -> Secret -> String -> RequestOptions -> List Provider.Turn -> List Provider.ToolSpec -> Task Error Provider.ToolResponse
+chatToolsViaResponses endpoint apiKey model options turns tools =
+    let
+        req = Http.defaultRequest endpoint
+    in
+        { req | method = "POST" } |> Http.withBearer apiKey
+            |> Http.withHeader "Content-Type" "application/json"
+            |> Http.withBody (encodeToolRequest model options turns tools)
+            |> Http.withTimeout openAiHttpTimeoutMs
+            |> Http.request
+            |> Task.andThen handleToolResponse
+
+
+handleToolResponse : Http.HttpResponse -> Task Error Provider.ToolResponse
+handleToolResponse resp =
+    if resp.status >= 200 && resp.status < 300 then
+        case decodeToolResponse resp.body of
+
+            Ok response ->
+                Task.succeed response
+
+            Err e ->
+                Task.fail e
+
+    else
+        Task.fail
+            (Error.unexpected
+                ("OpenAI Responses tools failed: HTTP "
+                    ++ String.fromInt resp.status
+                    ++ " — "
+                    ++ resp.body))
+
+
 {-| Decode a raw OpenAI Responses API body into a `Provider.ChatResponse` — the
 assistant text (the `output_text` parts joined) and the token `usage`. Exposed
 so a caller can decode a body it fetched itself, and so the mapping is testable.
@@ -86,14 +226,321 @@ decodeResponse body =
     JsonD.decodeString responseDecoder body
 
 
-requestBody : String -> List Message -> String
-requestBody model messages =
+{-| Decode a raw OpenAI Responses API body into a `Provider.ToolResponse`.
+`function_call` items become local `ToolCall`s, each carrying this provider's
+opaque continuation for the next tool-result request.
+-}
+decodeToolResponse : String -> Result Error Provider.ToolResponse
+decodeToolResponse body =
+    JsonD.decodeString toolResponseDecoder body
+
+
+{-| Encode the Responses API request body with legacy options. Passing `Nothing`
+to the old function omits `reasoning`, preserving the model default.
+-}
+encodeRequest : String -> Maybe ReasoningEffort -> List Message -> String
+encodeRequest model effort messages =
+    encodeRequestWithOptions model { reasoningEffort = effort } messages
+
+
+{-| Encode a Responses API request body with optional provider behavior. -}
+encodeRequestWithOptions : String -> RequestOptions -> List Message -> String
+encodeRequestWithOptions model options messages =
+    JsonE.encode 0 (JsonE.object (requestFields model options messages))
+
+
+{-| Encode a native-tool Responses request. A continuation produced by this
+provider uses `previous_response_id` and sends only turns after the latest tool
+call; all other histories are replayed as Responses input items.
+-}
+encodeToolRequest : String -> RequestOptions -> List Provider.Turn -> List Provider.ToolSpec -> String
+encodeToolRequest model options turns toolSpecs =
     JsonE.encode
         0
-        (JsonE.object
+        (JsonE.object (toolRequestFields model options turns toolSpecs))
+
+
+toolRequestFields : String -> RequestOptions -> List Provider.Turn -> List Provider.ToolSpec -> List ( String, JsonE.Value )
+toolRequestFields model options turns toolSpecs =
+    let
+        continuation = continuationContext turns
+        input =
+            case continuation of
+
+                Just context ->
+                    inputValues context.following
+
+                Nothing ->
+                    inputValues turns
+        base =
+            [ ( "model", JsonE.string model )
+            , ( "input", JsonE.list identity input )
+            ]
+        withContinuation =
+            case continuation of
+
+                Just context ->
+                    base
+                        ++ [ ( "previous_response_id"
+                             , JsonE.string context.responseId
+                             )
+                           ]
+
+                Nothing ->
+                    base
+        withReasoning =
+            case options.reasoningEffort of
+
+                Just selectedEffort ->
+                    withContinuation
+                        ++ [ ( "reasoning"
+                             , JsonE.object
+                                   [ ( "effort"
+                                     , JsonE.string
+                                           (reasoningEffortValue selectedEffort)
+                                     )
+                                   ]
+                             )
+                           ]
+
+                Nothing ->
+                    withContinuation
+        tools = requestToolValues toolSpecs
+    in
+        if List.isEmpty tools then
+            withReasoning
+
+        else
+            withReasoning ++ [ ( "tools", JsonE.list identity tools ) ]
+
+
+inputValues : List Provider.Turn -> List JsonE.Value
+inputValues turns =
+    List.concatMap turnInputValues turns
+
+
+turnInputValues : Provider.Turn -> List JsonE.Value
+turnInputValues turn =
+    case turn of
+
+        Provider.Say message ->
+            [ messageValue message ]
+
+        Provider.Called calls ->
+            List.map functionCallInputValue calls
+
+        Provider.Returned call output ->
+            [ functionCallOutputValue call output ]
+
+
+functionCallInputValue : Provider.ToolCall -> JsonE.Value
+functionCallInputValue call =
+    JsonE.object
+        [ ( "type", JsonE.string "function_call" )
+        , ( "call_id", JsonE.string call.id )
+        , ( "name", JsonE.string call.name )
+        , ( "arguments", JsonE.string call.arguments )
+        ]
+
+
+functionCallOutputValue : Provider.ToolCall -> String -> JsonE.Value
+functionCallOutputValue call output =
+    JsonE.object
+        [ ( "type", JsonE.string "function_call_output" )
+        , ( "call_id", JsonE.string call.id )
+        , ( "output", JsonE.string output )
+        ]
+
+
+requestToolValues : List Provider.ToolSpec -> List JsonE.Value
+requestToolValues toolSpecs =
+    List.map functionToolValue toolSpecs
+
+
+functionToolValue : Provider.ToolSpec -> JsonE.Value
+functionToolValue tool =
+    JsonE.object
+        [ ( "type", JsonE.string "function" )
+        , ( "name", JsonE.string tool.name )
+        , ( "description", JsonE.string tool.description )
+        , ( "parameters", JsonE.object [ ( "type", JsonE.string "object" ) ] )
+        , ( "strict", JsonE.bool False )
+        ]
+
+
+responsesContinuationPrefix : String
+responsesContinuationPrefix =
+    "sky-openai-responses:"
+
+
+continuationContext : List Provider.Turn -> Maybe ContinuationContext
+continuationContext turns =
+    case latestCallBatch turns of
+
+        Just batch ->
+            case commonResponseId batch.calls of
+
+                Just responseId ->
+                    Just
+                        { responseId = responseId, following = batch.following }
+
+                Nothing ->
+                    Nothing
+
+        Nothing ->
+            Nothing
+
+
+latestCallBatch : List Provider.Turn -> Maybe CallBatch
+latestCallBatch turns =
+    latestCallBatchHelp Nothing turns
+
+
+latestCallBatchHelp : Maybe CallBatch -> List Provider.Turn -> Maybe CallBatch
+latestCallBatchHelp latest turns =
+    case turns of
+
+        [] ->
+            latest
+
+        turn :: rest ->
+            case turn of
+
+                Provider.Called calls ->
+                    latestCallBatchHelp
+                        (Just { calls = calls, following = [] })
+                        rest
+
+                _ ->
+                    case latest of
+
+                        Just batch ->
+                            latestCallBatchHelp
+                                (Just
+                                    { batch | following = batch.following ++ [ turn ]
+                                    })
+                                rest
+
+                        Nothing ->
+                            latestCallBatchHelp Nothing rest
+
+
+commonResponseId : List Provider.ToolCall -> Maybe String
+commonResponseId calls =
+    case calls of
+
+        [] ->
+            Nothing
+
+        call :: rest ->
+            case responseIdForCall call of
+
+                Just responseId ->
+                    if allCallsUseResponse responseId rest then
+                        Just responseId
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+
+allCallsUseResponse : String -> List Provider.ToolCall -> Bool
+allCallsUseResponse responseId calls =
+    case calls of
+
+        [] ->
+            True
+
+        call :: rest ->
+            case responseIdForCall call of
+
+                Just callResponseId ->
+                    callResponseId == responseId
+                        && allCallsUseResponse responseId rest
+
+                Nothing ->
+                    False
+
+
+responseIdForCall : Provider.ToolCall -> Maybe String
+responseIdForCall call =
+    case call.continuation of
+
+        Just continuation ->
+            if String.startsWith responsesContinuationPrefix continuation then
+                let
+                    responseId =
+                        String.dropLeft
+                            (String.length responsesContinuationPrefix)
+                            continuation
+                in
+                    if String.isEmpty responseId then
+                        Nothing
+
+                    else
+                        Just responseId
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+requestFields : String -> RequestOptions -> List Message -> List ( String, JsonE.Value )
+requestFields model options messages =
+    let
+        base =
             [ ( "model", JsonE.string model )
             , ( "input", JsonE.list messageValue messages )
-            ])
+            ]
+        withReasoning =
+            case options.reasoningEffort of
+
+                Just selectedEffort ->
+                    base
+                        ++ [ ( "reasoning"
+                             , JsonE.object
+                                   [ ( "effort"
+                                     , JsonE.string
+                                           (reasoningEffortValue selectedEffort)
+                                     )
+                                   ]
+                             )
+                           ]
+
+                Nothing ->
+                    base
+    in
+        withReasoning
+
+
+reasoningEffortValue : ReasoningEffort -> String
+reasoningEffortValue effort =
+    case effort of
+
+        None ->
+            "none"
+
+        Minimal ->
+            "minimal"
+
+        Low ->
+            "low"
+
+        Medium ->
+            "medium"
+
+        High ->
+            "high"
+
+        XHigh ->
+            "xhigh"
+
+        Max ->
+            "max"
 
 
 messageValue m =
@@ -107,16 +554,77 @@ responseDecoder =
     JsonD.map2
         (\content usage -> { content = content, usage = usage })
         outputText
-        (JsonD.oneOf
-            [ JsonD.field "usage" usageDecoder
-            , JsonD.succeed
-                  { promptTokens = 0, completionTokens = 0, totalTokens = 0 }
-            ])
+        responseUsageDecoder
 
 
--- The Responses API returns an `output` array of items; a message item carries a
--- `content` array whose `output_text` parts hold the text. Concatenate them, so a
--- reasoning item or any non-text part contributes nothing rather than failing.
+toolResponseDecoder =
+    JsonD.map4
+        (\responseId content calls usage ->
+            { content = content
+            , toolCalls = List.map (toolCallWithContinuation responseId) calls
+            , usage = usage
+            })
+        responseIdDecoder
+        outputText
+        functionCalls
+        responseUsageDecoder
+
+
+responseIdDecoder =
+    JsonD.oneOf [ JsonD.field "id" JsonD.string, JsonD.succeed "" ]
+
+
+responseUsageDecoder =
+    JsonD.oneOf
+        [ JsonD.field "usage" usageDecoder
+        , JsonD.succeed
+              { promptTokens = 0, completionTokens = 0, totalTokens = 0 }
+        ]
+
+
+functionCalls =
+    JsonD.oneOf
+        [ JsonD.field "output" (JsonD.list functionCallItem)
+              |> JsonD.map (List.filterMap (\item -> item))
+        , JsonD.succeed []
+        ]
+
+
+functionCallItem =
+    JsonD.map4
+        (\itemType callId name arguments ->
+            if itemType == "function_call" then
+                Just { id = callId, name = name, arguments = arguments }
+
+            else
+                Nothing)
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "call_id" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "name" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "arguments" JsonD.string, JsonD.succeed "" ])
+
+
+toolCallWithContinuation : String -> ResponseFunctionCall -> Provider.ToolCall
+toolCallWithContinuation responseId call =
+    { id = call.id
+    , name = call.name
+    , arguments = call.arguments
+    , continuation = continuationForResponse responseId
+    }
+
+
+continuationForResponse : String -> Maybe String
+continuationForResponse responseId =
+    if String.isEmpty responseId then
+        Nothing
+
+    else
+        Just (responsesContinuationPrefix ++ responseId)
+
+
+-- The Responses API returns an `output` array of items; only a message item
+-- carries assistant text. A reasoning item or other non-message item contributes
+-- nothing rather than failing the whole response.
 outputText =
     JsonD.oneOf
         [ JsonD.field "output" (JsonD.list itemText)
@@ -126,11 +634,19 @@ outputText =
 
 
 itemText =
-    JsonD.oneOf
-        [ JsonD.field "content" (JsonD.list partText)
-              |> JsonD.map (String.join "")
-        , JsonD.succeed ""
-        ]
+    JsonD.map2
+        (\ty content ->
+            if ty == "message" then
+                content
+
+            else
+                "")
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf
+            [ JsonD.field "content" (JsonD.list partText)
+                  |> JsonD.map (String.join "")
+            , JsonD.succeed ""
+            ])
 
 
 partText =

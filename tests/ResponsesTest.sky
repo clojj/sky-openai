@@ -1,16 +1,15 @@
 module ResponsesTest exposing (tests)
 
-{-| Decode tests for `SkyOpenAI.Responses`. They feed a canonical OpenAI
-Responses API body through `decodeResponse` and assert the mapping onto a
-`Provider.ChatResponse`: the `output_text` parts are joined (a reasoning item is
-skipped), and the Responses `usage` (input/output/total tokens) maps onto the
-`Usage` record. No network.
+{-| Offline tests for `SkyOpenAI.Responses`. They decode a canonical OpenAI
+Responses API body into a `Provider.ChatResponse` and encode request payloads.
+No network.
 -}
 
 import Sky.Core.Prelude exposing (..)
 import Sky.Core.Result exposing (Result(..))
 import Sky.Test as Test exposing (Test)
 import SkyOpenAI.Responses as Responses
+import Std.Ai.Provider as Provider
 
 
 sampleBody : String
@@ -18,34 +17,164 @@ sampleBody =
     "{\"id\":\"resp_1\",\"model\":\"gpt-4o-mini\",\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello there\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}"
 
 
+toolCallBody : String
+toolCallBody =
+    "{\"id\":\"resp_tool_1\",\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_weather\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}"
+
+
+toolOptions : Responses.RequestOptions
+toolOptions =
+    { reasoningEffort = Nothing }
+
+
+weatherTool : Provider.ToolSpec
+weatherTool =
+    { name = "weather", description = "Return current weather." }
+
+
+responsesToolCall : Provider.ToolCall
+responsesToolCall =
+    { id = "call_weather"
+    , name = "weather"
+    , arguments = "{\"city\":\"Berlin\"}"
+    , continuation = Just "sky-openai-responses:resp_tool_1"
+    }
+
+
+foreignToolCall : Provider.ToolCall
+foreignToolCall =
+    { id = "call_weather"
+    , name = "weather"
+    , arguments = "{\"city\":\"Berlin\"}"
+    , continuation = Just "other-provider:response_1"
+    }
+
+
 tests : List Test
 tests =
     [ Test.suite
-          "SkyOpenAI.Responses.decodeResponse"
+          "SkyOpenAI.Responses"
           [ Test.test
-                "joins output_text parts and skips a reasoning item"
+                "decodes Responses output text"
                 (\_ ->
                     case Responses.decodeResponse sampleBody of
 
-                        Ok r ->
-                            Test.equal "Hello there" r.content
+                        Ok response ->
+                            Test.equal "Hello there" response.content
 
                         Err _ ->
                             Test.fail "decode failed")
           , Test.test
-                "reads Responses usage (input/output/total tokens)"
+                "reads Responses usage"
                 (\_ ->
                     case Responses.decodeResponse sampleBody of
 
-                        Ok r ->
+                        Ok response ->
                             Test.equal
                                 ( 12, 3, 15 )
-                                ( r.usage.promptTokens
-                                , r.usage.completionTokens
-                                , r.usage.totalTokens
+                                ( response.usage.promptTokens
+                                , response.usage.completionTokens
+                                , response.usage.totalTokens
                                 )
 
                         Err _ ->
                             Test.fail "decode failed")
+          , Test.test
+                "omits reasoning when it is not configured"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}]}"
+                        (Responses.encodeRequest
+                            "gpt-5.6-luna"
+                            Nothing
+                            [ Provider.user "Solve it." ]))
+          , Test.test
+                "encodes every GPT-5.6 Luna reasoning effort"
+                (\_ ->
+                    Test.equal
+                        [ "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"none\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"low\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"medium\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"high\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"xhigh\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"max\"}}"
+                        ]
+                        (List.map
+                            (\effort ->
+                                Responses.encodeRequest
+                                    "gpt-5.6-luna"
+                                    (Just effort)
+                                    [ Provider.user "Solve it." ])
+                            [ Responses.None
+                            , Responses.Low
+                            , Responses.Medium
+                            , Responses.High
+                            , Responses.XHigh
+                            , Responses.Max
+                            ]))
+          , Test.test
+                "encodes the model-dependent minimal effort"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"reasoning-model\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"minimal\"}}"
+                        (Responses.encodeRequest
+                            "reasoning-model"
+                            (Just Responses.Minimal)
+                            [ Provider.user "Solve it." ]))
+          , Test.test
+                "decodes Responses function calls with a continuation"
+                (\_ ->
+                    case Responses.decodeToolResponse toolCallBody of
+
+                        Ok response ->
+                            Test.equal
+                                ( "", [ responsesToolCall ], ( 12, 3, 15 ) )
+                                ( response.content
+                                , response.toolCalls
+                                , ( response.usage.promptTokens
+                                  , response.usage.completionTokens
+                                  , response.usage.totalTokens
+                                  )
+                                )
+
+                        Err _ ->
+                            Test.fail "decode failed")
+          , Test.test
+                "encodes local functions as flat Responses tools"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Weather in Berlin?\"}],\"tools\":[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"Return current weather.\",\"parameters\":{\"type\":\"object\"},\"strict\":false}]}"
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            ]
+                            [ weatherTool ]))
+          , Test.test
+                "continues Responses tool results with previous_response_id"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call_weather\",\"output\":\"18 C\"}],\"previous_response_id\":\"resp_tool_1\",\"tools\":[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"Return current weather.\",\"parameters\":{\"type\":\"object\"},\"strict\":false}]}"
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            , Provider.Called [ responsesToolCall ]
+                            , Provider.Returned responsesToolCall "18 C"
+                            ]
+                            [ weatherTool ]))
+          , Test.test
+                "replays tool turns for a foreign continuation"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Weather in Berlin?\"},{\"type\":\"function_call\",\"call_id\":\"call_weather\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_weather\",\"output\":\"18 C\"}],\"tools\":[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"Return current weather.\",\"parameters\":{\"type\":\"object\"},\"strict\":false}]}"
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            , Provider.Called [ foreignToolCall ]
+                            , Provider.Returned foreignToolCall "18 C"
+                            ]
+                            [ weatherTool ]))
           ]
     ]
